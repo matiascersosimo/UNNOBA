@@ -5,10 +5,15 @@ Uso:
   python ingesta.py                        # hoy
   python ingesta.py 16-10-2026             # un día
   python ingesta.py 12-10-2026 17-10-2026  # rango inclusive (backfill)
+  python ingesta.py --local                # reconstruye la base desde pdfs/ (sin internet)
+  python ingesta.py --local 13-10-2026 16-10-2026   # idem, solo ese rango
 
+Se descartan las entradas sin hora de inicio (ruido de las celdas de aula: capacidad, laboratorio, etc.).
+El fin es opcional: parciales, consultas y recuperatorios suelen traer solo la hora de inicio.
 Sale con código 1 si hubo errores o PDFs sospechosos (GitHub Actions marca la corrida en rojo).
 Requiere aulas.py en la misma carpeta (reutiliza norm() y celdas_por_aula()).
 """
+import glob
 import hashlib
 import io
 import os
@@ -25,6 +30,7 @@ import aulas
 DB = "aulas.db"
 GUARDAR_PDFS = True   # deja una copia en pdfs/ (útil para tests de regresión del parser)
 MIN_FILAS = 5         # menos que esto = el parseo probablemente falló; no se pisa lo guardado
+PARSER_VERSION = "4"  # se suma al hash: si cambia el parser, los PDFs ya guardados se reprocesan solos
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ingestas (
@@ -38,24 +44,32 @@ CREATE TABLE IF NOT EXISTS clases (
     edificio_nombre TEXT,
     aula TEXT, piso TEXT,
     materia_id TEXT NOT NULL,       -- slug canónico: matematica-discreta
-    materia_nombre TEXT NOT NULL,   -- normalizado, sin (T)/(P)/COM./CONSULTA
+    materia_nombre TEXT NOT NULL,   -- normalizado (sin tildes), sin (T)/(P)/COM./CONSULTA
+    materia_titulo TEXT NOT NULL,   -- igual pero con tildes, para mostrar
     comision INTEGER,
-    tipo TEXT,                      -- clase | teoria | practica | consulta | parcial
-    inicio TEXT, fin TEXT,          -- HH:MM
+    tipo TEXT,                      -- clase | teoria | practica | consulta | parcial | recuperatorio
+    inicio TEXT, fin TEXT,          -- HH:MM (fin puede ser NULL)
     nota TEXT                       -- texto suelto tras el horario (ej: NO HAY CLASES)
 );
 CREATE INDEX IF NOT EXISTS idx_clases_fecha_materia ON clases (fecha, materia_id);
 CREATE TABLE IF NOT EXISTS materias (   -- catálogo que se arma solo desde los PDFs
-    materia_id TEXT PRIMARY KEY, nombre TEXT, primera_vez TEXT, ultima_vez TEXT
+    materia_id TEXT PRIMARY KEY, nombre TEXT, titulo TEXT, primera_vez TEXT, ultima_vez TEXT
 );
 CREATE TABLE IF NOT EXISTS aliases (    -- para después: alias -> materia_id
     alias TEXT PRIMARY KEY, materia_id TEXT NOT NULL
 );
 """
 
-RANGO = re.compile(r"(\d{1,2}(?::\d{2})?\s*A\s*\d{1,2}(?::\d{2})?)", re.I)
-HORA = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*A\s*(\d{1,2})(?::(\d{2}))?", re.I)
-RUIDO = re.compile(r"\((?:T|P)\)|\bCOM\.?\s*\d+\b|\bCONSULTAS?\b|\bPARCIAL\b|\bNO HAY CLASES\b")
+# Horario: "16:00 A 19:00", "9 A 13", "16:00 19:00" (sin A) o "16:00-19:00".
+# Sin separador explícito se exigen los dos ":MM" para no confundir "COM. 1 17:00" con un rango.
+RANGO = re.compile(
+    r"(\d{1,2}:\d{2}\s*(?:A|-|–)?\s*\d{1,2}:\d{2}|\d{1,2}(?::\d{2})?\s*A\s*\d{1,2}(?::\d{2})?)",
+    re.I,
+)
+HORA = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(?:A|-|–)?\s*(\d{1,2})(?::(\d{2}))?", re.I)
+RUIDO = re.compile(
+    r"\((?:T|P)\)|\bCOM\.?\s*\d+\b|\bCONSULTAS?\b|\bPARCIAL\b|\bRECUPERATORIO\b|\bNO HAY CLASES\b"
+)
 
 
 def hhmm(h, m):
@@ -68,7 +82,7 @@ def slug(nombre):
 
 def filas_de_celda(texto):
     """Una celda puede tener varias materias; devuelve un dict por cada una."""
-    n = aulas.norm(texto)
+    n = re.sub(r"\s+", " ", texto or "").upper().strip()  # mayúsculas, conserva tildes
     partes = RANGO.split(n)  # [nombre, horario, nombre, horario, ..., cola]
     if len(partes) == 1:
         bloques = [(partes[0], None, "")]
@@ -94,6 +108,8 @@ def filas_de_celda(texto):
             tipo = "consulta"
         elif "PARCIAL" in completo:
             tipo = "parcial"
+        elif "RECUPERATORIO" in completo:
+            tipo = "recuperatorio"
         elif "(T)" in completo:
             tipo = "teoria"
         elif "(P)" in completo:
@@ -101,7 +117,8 @@ def filas_de_celda(texto):
         else:
             tipo = "clase"
         out.append({
-            "materia_id": slug(limpio), "materia_nombre": limpio,
+            "materia_id": slug(aulas.norm(limpio)), "materia_nombre": aulas.norm(limpio),
+            "materia_titulo": limpio,
             "comision": int(com[1]) if com else None, "tipo": tipo,
             "inicio": inicio, "fin": fin, "nota": cola.strip(),
         })
@@ -109,10 +126,13 @@ def filas_de_celda(texto):
 
 
 def parsear_pdf(pdf_bytes, ed_key):
-    filas, vistos = [], set()
+    filas, vistos, descartadas = [], set(), []
 
     def agregar(aula, piso, celda, edificio_nombre):
         for f in filas_de_celda(celda):
+            if not f["inicio"]:  # sin ninguna hora: ruido de las celdas de aula (capacidad, etc.)
+                descartadas.append((aula, f["materia_nombre"]))
+                continue
             f.update(aula=aula, piso=piso, edificio=ed_key, edificio_nombre=edificio_nombre)
             clave = (aula, f["materia_id"], f["comision"], f["tipo"], f["inicio"], f["fin"])
             if clave not in vistos:  # las tablas partidas pueden repetir una celda
@@ -137,7 +157,7 @@ def parsear_pdf(pdf_bytes, ed_key):
                 r"(AULA MAGNA|LEMEJ):\s*(.*?)(?=(?:AULA MAGNA|LEMEJ):|\Z)", texto, re.S
             ):
                 agregar(lugar.title(), "", resto, nombre_ed)
-    return filas
+    return filas, descartadas
 
 
 def guardar(con, fecha_iso, ed, sha, filas):
@@ -153,15 +173,19 @@ def guardar(con, fecha_iso, ed, sha, filas):
         con.execute("DELETE FROM clases WHERE fecha=? AND edificio=?", (fecha_iso, ed))
         con.executemany(
             """INSERT INTO clases (fecha, edificio, edificio_nombre, aula, piso, materia_id,
-                   materia_nombre, comision, tipo, inicio, fin, nota)
+                   materia_nombre, materia_titulo, comision, tipo, inicio, fin, nota)
                VALUES (:fecha, :edificio, :edificio_nombre, :aula, :piso, :materia_id,
-                   :materia_nombre, :comision, :tipo, :inicio, :fin, :nota)""",
+                   :materia_nombre, :materia_titulo, :comision, :tipo, :inicio, :fin, :nota)""",
             [{**f, "fecha": fecha_iso} for f in filas],
         )
         con.executemany(
-            """INSERT INTO materias (materia_id, nombre, primera_vez, ultima_vez) VALUES (?, ?, ?, ?)
-               ON CONFLICT(materia_id) DO UPDATE SET ultima_vez = excluded.ultima_vez""",
-            [(f["materia_id"], f["materia_nombre"], fecha_iso, fecha_iso) for f in filas],
+            """INSERT INTO materias (materia_id, nombre, titulo, primera_vez, ultima_vez)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(materia_id) DO UPDATE SET
+                   ultima_vez = MAX(ultima_vez, excluded.ultima_vez),
+                   primera_vez = MIN(primera_vez, excluded.primera_vez)""",
+            [(f["materia_id"], f["materia_nombre"], f["materia_titulo"], fecha_iso, fecha_iso)
+             for f in filas],
         )
         con.execute(
             "INSERT OR REPLACE INTO ingestas VALUES (?, ?, ?, ?, ?)",
@@ -171,7 +195,14 @@ def guardar(con, fecha_iso, ed, sha, filas):
     return ("actualizado" if prev else "nuevo"), (nuevas - viejas, viejas - nuevas)
 
 
-def procesar(con, fecha, ed):
+def leer_pdf(fecha, ed, local):
+    """Bytes del PDF, o None si no hay (404 / archivo inexistente). Con local=True no toca internet."""
+    ruta = f"pdfs/{fecha:%Y-%m-%d}_{ed}.pdf"
+    if local:
+        if not os.path.exists(ruta):
+            return None
+        with open(ruta, "rb") as f:
+            return f.read()
     r = requests.get(
         aulas.BASE,
         params={"campus": "junin", "building": ed, "date": f"{fecha:%d-%m-%Y}"},
@@ -179,22 +210,33 @@ def procesar(con, fecha, ed):
         timeout=30,
     )
     if r.status_code == 404:
-        return "sin_pdf", None
+        return None
     r.raise_for_status()
     if not r.content.startswith(b"%PDF"):
         raise RuntimeError("la respuesta no es un PDF (¿bloqueo anti-bots?)")
-    sha = hashlib.sha256(r.content).hexdigest()
-    filas = parsear_pdf(r.content, ed)
-    if len(filas) < MIN_FILAS:
-        return "sospechoso", f"solo {len(filas)} filas parseadas: no se guarda"
     if GUARDAR_PDFS:
         os.makedirs("pdfs", exist_ok=True)
-        with open(f"pdfs/{fecha:%Y-%m-%d}_{ed}.pdf", "wb") as f:
+        with open(ruta, "wb") as f:
             f.write(r.content)
-    return guardar(con, f"{fecha:%Y-%m-%d}", ed, sha, filas)
+    return r.content
 
 
-def fechas_desde_args(args):
+def procesar(con, fecha, ed, local=False):
+    contenido = leer_pdf(fecha, ed, local)
+    if contenido is None:
+        return "sin_pdf", None, 0
+    sha = hashlib.sha256(contenido + PARSER_VERSION.encode()).hexdigest()
+    filas, descartadas = parsear_pdf(contenido, ed)
+    if len(filas) < MIN_FILAS:
+        return "sospechoso", f"solo {len(filas)} filas con horario: no se guarda", len(descartadas)
+    estado, extra = guardar(con, f"{fecha:%Y-%m-%d}", ed, sha, filas)
+    return estado, extra, len(descartadas)
+
+
+def fechas_desde_args(args, local):
+    if local and not args:  # todas las fechas que haya en pdfs/
+        nombres = sorted({os.path.basename(p)[:10] for p in glob.glob("pdfs/*.pdf")})
+        return [datetime.strptime(n, "%Y-%m-%d") for n in nombres]
     hoy = datetime.now(timezone(timedelta(hours=-3))).replace(tzinfo=None)
     if not args:
         return [hoy]
@@ -204,15 +246,17 @@ def fechas_desde_args(args):
 
 
 def main():
+    local = "--local" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     con = sqlite3.connect(DB)
     con.executescript(SCHEMA)
     mal = False
-    for fecha in fechas_desde_args(sys.argv[1:]):
+    for fecha in fechas_desde_args(args, local):
         for ed in aulas.EDIFICIOS:
             try:
-                estado, extra = procesar(con, fecha, ed)
+                estado, extra, n_desc = procesar(con, fecha, ed, local)
             except Exception as e:  # noqa: BLE001
-                estado, extra = "error", str(e)
+                estado, extra, n_desc = "error", str(e), 0
             detalle = ""
             if estado in ("nuevo", "actualizado"):
                 n = con.execute(
@@ -223,6 +267,8 @@ def main():
                     detalle += f" | +{len(extra[0])} -{len(extra[1])} vs. la versión anterior"
             elif extra:
                 detalle = str(extra)
+            if n_desc:
+                detalle += f" | {n_desc} descartadas (sin hora)"
             print(f"{fecha:%d-%m-%Y} {ed:9} {estado:12} {detalle}")
             mal |= estado in ("error", "sospechoso")
     sys.exit(1 if mal else 0)

@@ -23,7 +23,7 @@ EDIFICIOS = ["evaperon", "anexo"]
 MATERIAS = {
     "Matemática Discreta": r"MATEMATICA DISCRETA",
     "Física 2": r"FISICA (II|2)\b",
-    "IPOO": r"\bIPOO\b|PROGRAMACION ORIENTADA A OBJETOS",
+    "IPOO": r"\bIPOO\b",
     "Base de Datos 1": r"BASES? DE DATOS (I|1)\b",
 }
 
@@ -138,8 +138,6 @@ def bajar(edificio, fecha):
         headers=HEADERS,
         timeout=30,
     )
-    if r.status_code == 404:
-        raise FileNotFoundError("sin PDF publicado")
     r.raise_for_status()
     if not r.content.startswith(b"%PDF"):
         raise RuntimeError("la respuesta no es un PDF (¿bloqueo anti-bots o todavía no lo subieron?)")
@@ -182,16 +180,11 @@ def main():
         return
     fecha = f"{hoy:%d-%m-%Y}"
     res, errores = [], []
-    res, errores, sin_pdf = [], [], 0
     for ed in EDIFICIOS:
-        try:    
+        try:
             res += analizar(bajar(ed, fecha), ed)
-        except FileNotFoundError:
-            sin_pdf += 1
         except Exception as e:  # noqa: BLE001
             errores.append(f"No pude leer '{ed}': {e}")
-    if sin_pdf == len(EDIFICIOS):
-        errores = ["No hay distribución publicada para hoy (¿feriado o sin clases?)"]
     enviar(armar_mensaje(hoy, res, errores))
 
 

@@ -14,12 +14,14 @@ con = sqlite3.connect("aulas.db")
 args = sys.argv[1:]
 
 if not args:
-    for mid, nombre, a, b in con.execute("SELECT * FROM materias ORDER BY nombre"):
-        print(f"{mid:55} {a} .. {b}")
+    for mid, titulo, a, b in con.execute(
+        "SELECT materia_id, titulo, primera_vez, ultima_vez FROM materias ORDER BY nombre"
+    ):
+        print(f"{mid:55} {titulo[:40]:40} {a} .. {b}")
 else:
     fecha = datetime.strptime(args[0], "%d-%m-%Y").strftime("%Y-%m-%d")
     filtro = f"%{aulas.norm(args[1])}%" if len(args) > 1 else "%"
-    q = """SELECT inicio, fin, materia_nombre, tipo, comision, aula, piso, edificio
+    q = """SELECT inicio, fin, materia_titulo, tipo, comision, aula, piso, edificio
            FROM clases WHERE fecha=? AND materia_nombre LIKE ? ORDER BY inicio, edificio, aula"""
     for ini, fin, nom, tipo, com, aula, piso, ed in con.execute(q, (fecha, filtro)):
         c = f" COM.{com}" if com else ""

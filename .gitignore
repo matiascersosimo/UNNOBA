@@ -1,1 +1,9 @@
 __pycache__/
+*.pyc
+# aulas.db se reconstruye desde pdfs/ con: python ingesta.py --local
+aulas.db
+# datos de usuarios, secretos y logs: NUNCA a git
+usuarios.db
+backups/
+.env
+logs/
